@@ -3,7 +3,9 @@ Entony — Configuration
 Loads environment variables with typed validation via pydantic-settings.
 """
 
+import json
 import os
+from typing import Dict
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from functools import lru_cache
 
@@ -19,9 +21,14 @@ class Settings(BaseSettings):
     # Evolution API (webhook security)
     evolution_api_key: str = ""
 
-    # Conversion settings
+    # Conversion settings — multi-label map (preferred)
+    # JSON string: '{"vendido":"Purchase","lead":"LeadSubmitted"}'
+    conversion_tag_map_json: str = ""
+
+    # Legacy single-mapping (used as fallback if conversion_tag_map_json is empty)
     conversion_tag_name: str = "Pago"
     conversion_event_name: str = "Purchase"
+
     conversion_default_value: float = 0.0
     conversion_currency: str = "BRL"
 
@@ -39,6 +46,20 @@ class Settings(BaseSettings):
         extra="ignore",
         case_sensitive=False,
     )
+
+    @property
+    def conversion_tag_map(self) -> Dict[str, str]:
+        """Returns label→event map.
+
+        Uses CONVERSION_TAG_MAP_JSON if set; falls back to the legacy
+        CONVERSION_TAG_NAME / CONVERSION_EVENT_NAME single-mapping.
+        """
+        if self.conversion_tag_map_json:
+            try:
+                return json.loads(self.conversion_tag_map_json)
+            except json.JSONDecodeError:
+                pass
+        return {self.conversion_tag_name: self.conversion_event_name}
 
 
 @lru_cache()
