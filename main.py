@@ -81,8 +81,10 @@ async def startup():
     logger.info("=" * 60)
     logger.info("🚀 ENTONY — Webhook Listener starting up...")
     logger.info(f"   📡 Meta Pixel ID: {settings.meta_pixel_id}")
-    logger.info(f"   🏷️  Conversion Tag: \"{settings.conversion_tag_name}\"")
-    logger.info(f"   📊 Event Name: {settings.conversion_event_name}")
+    tag_map = settings.conversion_tag_map
+    logger.info(f"   🏷️  Label→Event mappings ({len(tag_map)}):")
+    for tag, event in tag_map.items():
+        logger.info(f"      • \"{tag}\" → {event}")
     logger.info(f"   💰 Default Value: {settings.conversion_currency} {settings.conversion_default_value}")
     logger.info(f"   🗄️  Supabase: {'Enabled' if supabase_logger.is_enabled else 'Disabled (local mode)'}")
     logger.info(f"   🌐 Server: {settings.host}:{settings.port}")
@@ -102,7 +104,7 @@ async def health():
         "service": "Entony",
         "version": "1.0.0",
         "meta_pixel_id": settings.meta_pixel_id,
-        "conversion_tag": settings.conversion_tag_name,
+        "conversion_tags": list(settings.conversion_tag_map.keys()),
         "supabase_enabled": supabase_logger.is_enabled,
         "timestamp": datetime.utcnow().isoformat(),
     }
@@ -194,15 +196,17 @@ async def webhook_whatsapp(request: Request):
 
     logger.info(f"🏷️ Label detected: \"{label_name}\"")
 
-    # ── 6. Check if it matches our conversion tag ──────────────────────
-    target_tag = settings.conversion_tag_name.strip().lower()
-    if label_name.strip().lower() != target_tag:
+    # ── 6. Check if it matches any configured conversion tag ──────────────
+    tag_map = {k.strip().lower(): v for k, v in settings.conversion_tag_map.items()}
+    event_name = tag_map.get(label_name.strip().lower())
+
+    if not event_name:
         logger.info(
-            f"⏭️ Label \"{label_name}\" does not match target \"{settings.conversion_tag_name}\" — Skipping"
+            f"⏭️ Label \"{label_name}\" does not match any configured tag — Skipping"
         )
         return ConversionResponse(
             success=True,
-            message=f"Label '{label_name}' does not match target '{settings.conversion_tag_name}'",
+            message=f"Label '{label_name}' does not match any configured conversion tag",
         )
 
     # ── 7. Extract phone number ────────────────────────────────────────
@@ -225,11 +229,11 @@ async def webhook_whatsapp(request: Request):
     lead_id = await supabase_logger.find_lead_id_by_phone(normalized_phone)
 
     # ── 9. Fire conversion event to Meta CAPI ──────────────────────────
-    logger.info(f"🔥 FIRING CONVERSION → Meta CAPI: {settings.conversion_event_name}")
+    logger.info(f"🔥 FIRING CONVERSION → Meta CAPI: {event_name}")
 
     meta_result = await meta_capi_client.send_event(
         phone=normalized_phone,
-        event_name=settings.conversion_event_name,
+        event_name=event_name,
         value=settings.conversion_default_value,
         currency=settings.conversion_currency,
         fbclid=fbclid,
@@ -241,7 +245,7 @@ async def webhook_whatsapp(request: Request):
 
     await supabase_logger.log_conversion(
         phone_hash=phone_hash,
-        event_name=settings.conversion_event_name,
+        event_name=event_name,
         value=settings.conversion_default_value,
         currency=settings.conversion_currency,
         tag_name=label_name,
@@ -254,14 +258,14 @@ async def webhook_whatsapp(request: Request):
 
     # ── 11. Return response ────────────────────────────────────────────
     if meta_result.get("success"):
-        logger.info(f"✅ CONVERSION SENT SUCCESSFULLY — {settings.conversion_event_name} for {normalized_phone[:6]}***")
+        logger.info(f"✅ CONVERSION SENT SUCCESSFULLY — {event_name} for {normalized_phone[:6]}***")
     else:
         logger.error(f"❌ CONVERSION FAILED — {meta_result.get('error')}")
 
     return ConversionResponse(
         success=meta_result.get("success", False),
         message=f"Conversion {'sent' if meta_result.get('success') else 'failed'} for tag '{label_name}'",
-        event_name=settings.conversion_event_name,
+        event_name=event_name,
         phone_hash=phone_hash,
         meta_response=meta_result,
     )
