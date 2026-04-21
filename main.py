@@ -137,12 +137,13 @@ async def webhook_whatsapp(request: Request):
             incoming_key = request.query_params.get("apikey", "")
 
         incoming_key = (incoming_key or "").strip()
+        expected_key = (settings.evolution_api_key or "").strip()
 
-        if incoming_key != settings.evolution_api_key.strip():
+        if incoming_key != expected_key:
             logger.warning(
-                f"⛔ Unauthorized webhook attempt — Key mismatch | "
-                f"Received: '{incoming_key[:3]}...' (len: {len(incoming_key)}) | "
-                f"Expected: '{settings.evolution_api_key[:3]}...' (len: {len(settings.evolution_api_key.strip())})"
+                f"⛔ Unauthorized webhook attempt — Key mismatch. "
+                f"Received length: {len(incoming_key)}, Expected length: {len(expected_key)}. "
+                f"Received starts with: '{incoming_key[:4]}...', Expected starts with: '{expected_key[:4]}...'"
             )
             raise HTTPException(status_code=401, detail="Invalid API key")
 
