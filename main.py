@@ -3,8 +3,11 @@ Entony — Webhook Listener
 Evolution API (WhatsApp Labels) → Meta Conversions API (CAPI)
 
 This microservice listens for label/tag events from Evolution API,
-filters for a specific tag (default: "Pago"), and fires conversion
-events to Meta's Conversions API for precise ad attribution.
+filters for configured tags, and fires conversion events to Meta's
+Conversions API for precise ad attribution.
+
+Supports multiple tags via CONVERSION_TAG_MAP_JSON:
+  {"vendido": "Purchase", "lead": "LeadSubmitted", ...}
 
 Author: Vibe Energia
 """
@@ -39,7 +42,7 @@ logger = logging.getLogger("entony")
 app = FastAPI(
     title="Entony — Webhook Listener",
     description="Evolution API → Meta CAPI bridge for conversion tracking",
-    version="1.0.0",
+    version="2.0.0",
 )
 
 # CORS (allow all for webhook compatibility)
@@ -78,14 +81,14 @@ class ConversionLog(BaseModel):
 @app.on_event("startup")
 async def startup():
     settings = get_settings()
+    tag_map = settings.get_tag_map()
+
     logger.info("=" * 60)
-    logger.info("🚀 ENTONY — Webhook Listener starting up...")
+    logger.info("🚀 ENTONY v2.0 — Webhook Listener starting up...")
     logger.info(f"   📡 Meta Pixel ID: {settings.meta_pixel_id}")
-    tag_map = settings.conversion_tag_map
-    logger.info(f"   🏷️  Label→Event mappings ({len(tag_map)}):")
-    for tag, event in tag_map.items():
-        logger.info(f"      • \"{tag}\" → {event}")
+    logger.info(f"   🏷️  Tag Map: {json.dumps(tag_map, ensure_ascii=False)}")
     logger.info(f"   💰 Default Value: {settings.conversion_currency} {settings.conversion_default_value}")
+    logger.info(f"   🔑 API Key configured: {'Yes' if settings.evolution_api_key else 'No (open)'}")
     logger.info(f"   🗄️  Supabase: {'Enabled' if supabase_logger.is_enabled else 'Disabled (local mode)'}")
     logger.info(f"   🌐 Server: {settings.host}:{settings.port}")
     logger.info("=" * 60)
@@ -102,9 +105,9 @@ async def health():
     return {
         "status": "healthy",
         "service": "Entony",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "meta_pixel_id": settings.meta_pixel_id,
-        "conversion_tags": list(settings.conversion_tag_map.keys()),
+        "tag_map": settings.get_tag_map(),
         "supabase_enabled": supabase_logger.is_enabled,
         "timestamp": datetime.utcnow().isoformat(),
     }
@@ -119,12 +122,11 @@ async def webhook_whatsapp(request: Request):
     Receive webhook events from Evolution API.
 
     Filters for label/tag events and fires conversion events to Meta CAPI
-    when the configured tag (default: "Pago") is applied to a contact.
+    when a configured tag is applied to a contact.
 
-    Expected Evolution API events:
-    - labels.edit
-    - labels.association
-    - label (varies by Evolution version)
+    The apikey can be sent via:
+    - HTTP header: apikey, x-api-key, or Authorization: Bearer <key>
+    - Body JSON field: apikey (Evolution API default behavior)
 
     Configure this URL in your Evolution API webhook settings:
         URL: https://your-domain:9000/webhook/whatsapp
@@ -142,16 +144,35 @@ async def webhook_whatsapp(request: Request):
     logger.info(f"📨 Webhook received — Keys: {list(body.keys())}")
     logger.debug(f"📨 Full payload: {json.dumps(body, ensure_ascii=False, indent=2)}")
 
-    # ── 2. Validate API Key (optional security layer) ──────────────────
+    # ── 2. Validate API Key ────────────────────────────────────────────
+    #    Evolution API sends the apikey INSIDE the body JSON, not in
+    #    HTTP headers. We check both locations for maximum compatibility.
     if settings.evolution_api_key:
+        # Try headers first (standard HTTP auth)
         incoming_key = (
             request.headers.get("apikey")
             or request.headers.get("x-api-key")
-            or request.headers.get("authorization", "").replace("Bearer ", "")
+            or request.headers.get("authorization", "").replace("Bearer ", "").strip()
         )
+
+        # Fallback: read apikey from body JSON (Evolution API behavior)
+        if not incoming_key and isinstance(body, dict):
+            incoming_key = body.get("apikey", "")
+
+        # Also check query params
+        if not incoming_key:
+            incoming_key = request.query_params.get("apikey", "")
+
+        incoming_key = (incoming_key or "").strip()
+
         if incoming_key != settings.evolution_api_key:
-            logger.warning(f"⛔ Unauthorized webhook attempt — Key mismatch")
+            logger.warning(
+                f"⛔ Unauthorized webhook attempt — Key mismatch "
+                f"(received: '{incoming_key[:8]}...' vs expected: '{settings.evolution_api_key[:8]}...')"
+            )
             raise HTTPException(status_code=401, detail="Invalid API key")
+
+        logger.debug("🔑 API key validated successfully")
 
     # ── 3. Detect event type ───────────────────────────────────────────
     # Evolution API sends different event structures depending on version.
@@ -196,18 +217,22 @@ async def webhook_whatsapp(request: Request):
 
     logger.info(f"🏷️ Label detected: \"{label_name}\"")
 
-    # ── 6. Check if it matches any configured conversion tag ──────────────
-    tag_map = {k.strip().lower(): v for k, v in settings.conversion_tag_map.items()}
-    event_name = tag_map.get(label_name.strip().lower())
+    # ── 6. Check if it matches any configured tag ──────────────────────
+    tag_map = settings.get_tag_map()
+    tag_key = label_name.strip().lower()
 
-    if not event_name:
+    if tag_key not in tag_map:
         logger.info(
-            f"⏭️ Label \"{label_name}\" does not match any configured tag — Skipping"
+            f"⏭️ Label \"{label_name}\" not in tag map {list(tag_map.keys())} — Skipping"
         )
         return ConversionResponse(
             success=True,
-            message=f"Label '{label_name}' does not match any configured conversion tag",
+            message=f"Label '{label_name}' not configured for conversion tracking",
         )
+
+    # Get the Meta event name for this tag
+    meta_event_name = tag_map[tag_key]
+    logger.info(f"🎯 Tag matched! \"{label_name}\" → Meta Event: \"{meta_event_name}\"")
 
     # ── 7. Extract phone number ────────────────────────────────────────
     phone = _extract_phone(body)
@@ -228,12 +253,17 @@ async def webhook_whatsapp(request: Request):
     fbclid = await supabase_logger.find_fbclid_by_phone(normalized_phone)
     lead_id = await supabase_logger.find_lead_id_by_phone(normalized_phone)
 
+    if fbclid:
+        logger.info(f"🔗 fbclid found — precise attribution enabled")
+    else:
+        logger.info(f"🔗 No fbclid found — using phone-only attribution")
+
     # ── 9. Fire conversion event to Meta CAPI ──────────────────────────
-    logger.info(f"🔥 FIRING CONVERSION → Meta CAPI: {event_name}")
+    logger.info(f"🔥 FIRING CONVERSION → Meta CAPI: {meta_event_name}")
 
     meta_result = await meta_capi_client.send_event(
         phone=normalized_phone,
-        event_name=event_name,
+        event_name=meta_event_name,
         value=settings.conversion_default_value,
         currency=settings.conversion_currency,
         fbclid=fbclid,
@@ -245,7 +275,7 @@ async def webhook_whatsapp(request: Request):
 
     await supabase_logger.log_conversion(
         phone_hash=phone_hash,
-        event_name=event_name,
+        event_name=meta_event_name,
         value=settings.conversion_default_value,
         currency=settings.conversion_currency,
         tag_name=label_name,
@@ -258,14 +288,14 @@ async def webhook_whatsapp(request: Request):
 
     # ── 11. Return response ────────────────────────────────────────────
     if meta_result.get("success"):
-        logger.info(f"✅ CONVERSION SENT SUCCESSFULLY — {event_name} for {normalized_phone[:6]}***")
+        logger.info(f"✅ CONVERSION SENT SUCCESSFULLY — {meta_event_name} for {normalized_phone[:6]}***")
     else:
         logger.error(f"❌ CONVERSION FAILED — {meta_result.get('error')}")
 
     return ConversionResponse(
         success=meta_result.get("success", False),
         message=f"Conversion {'sent' if meta_result.get('success') else 'failed'} for tag '{label_name}'",
-        event_name=event_name,
+        event_name=meta_event_name,
         phone_hash=phone_hash,
         meta_response=meta_result,
     )
@@ -378,12 +408,20 @@ def _extract_phone(payload: Dict[str, Any]) -> Optional[str]:
     - remoteJid format (5511999998888@s.whatsapp.net)
     - Direct phone fields
     - Nested contact data
+    - 'destination' field (Evolution API v2)
+    - 'sender' field
     """
     data = payload.get("data", payload)
 
     # Direct phone fields
     for key in ["phone", "number", "remoteJid", "jid", "chatId", "wuid"]:
         val = data.get(key)
+        if val and isinstance(val, str):
+            return val
+
+    # Check top-level 'destination' and 'sender' (Evolution API v2 format)
+    for key in ["destination", "sender"]:
+        val = payload.get(key)
         if val and isinstance(val, str):
             return val
 

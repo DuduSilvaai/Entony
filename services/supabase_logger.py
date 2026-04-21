@@ -1,50 +1,63 @@
 """
-Supabase Logger Service
-Handles audit logging of conversion events and fbclid lookup.
+Entony — Supabase Audit Logger
 
-If Supabase is not configured, operates in local-only mode (logs to console).
+Logs conversion events to Supabase for auditing and fbclid lookup.
+Gracefully degrades to local-only logging when Supabase is not configured.
 """
 
+import json
 import logging
-from typing import Optional, Dict, Any
 from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
-from config import get_settings
-
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("entony")
 
 
 class SupabaseLogger:
     """
-    Audit logger for Meta CAPI conversion events.
+    Supabase client for audit logging and fbclid lookup.
 
-    Responsibilities:
-    - Log every conversion dispatch to `meta_conversion_logs` table
-    - Look up fbclid from leads table for precise attribution
+    If Supabase credentials are not configured, all methods are no-ops
+    that return empty/default values — the app works without Supabase.
     """
 
     def __init__(self):
-        settings = get_settings()
         self._client = None
-        self._enabled = False
+        self._is_enabled = False
+        self._init_attempted = False
 
-        if settings.supabase_url and settings.supabase_service_key:
-            try:
-                from supabase import create_client
-                self._client = create_client(
-                    settings.supabase_url,
-                    settings.supabase_service_key,
-                )
-                self._enabled = True
-                logger.info("✅ Supabase Logger initialized — Audit logging enabled")
-            except Exception as e:
-                logger.warning(f"⚠️ Supabase Logger failed to init: {e} — Running in local-only mode")
-        else:
-            logger.info("ℹ️ Supabase not configured — Running in local-only mode (logs to console)")
+    def _ensure_init(self):
+        """Lazy-initialize the Supabase client."""
+        if self._init_attempted:
+            return
+
+        self._init_attempted = True
+
+        try:
+            from config import get_settings
+            settings = get_settings()
+
+            if not settings.supabase_url or not settings.supabase_service_key:
+                logger.info("🗄️ Supabase not configured — running in local-only mode")
+                return
+
+            from supabase import create_client
+            self._client = create_client(
+                settings.supabase_url,
+                settings.supabase_service_key,
+            )
+            self._is_enabled = True
+            logger.info("🗄️ Supabase connected successfully")
+
+        except ImportError:
+            logger.warning("🗄️ supabase-py not installed — running in local-only mode")
+        except Exception as e:
+            logger.error(f"🗄️ Supabase init error: {e} — running in local-only mode")
 
     @property
     def is_enabled(self) -> bool:
-        return self._enabled
+        self._ensure_init()
+        return self._is_enabled
 
     async def log_conversion(
         self,
@@ -58,32 +71,17 @@ class SupabaseLogger:
         lead_id: Optional[str] = None,
         status: str = "sent",
         error_message: Optional[str] = None,
-    ) -> Optional[Dict[str, Any]]:
-        """
-        Log a conversion event dispatch for audit purposes.
+    ) -> Optional[Dict]:
+        """Log a conversion event to the entony_conversions table."""
+        self._ensure_init()
 
-        Args:
-            phone_hash: SHA256 hash of the normalized phone
-            event_name: Meta event name (Purchase, Lead, etc.)
-            value: Conversion value
-            currency: Currency code
-            tag_name: WhatsApp label name that triggered this
-            meta_response: Raw response from Meta CAPI
-            fbclid: Facebook Click ID if available
-            lead_id: UUID of the lead in Supabase
-            status: "sent", "error", "skipped"
-            error_message: Error description if status is "error"
-
-        Returns:
-            The inserted row or None
-        """
-        log_entry = {
+        record = {
             "phone_hash": phone_hash,
             "event_name": event_name,
             "event_value": value,
             "currency": currency,
             "tag_name": tag_name,
-            "meta_response": meta_response,
+            "meta_response": json.dumps(meta_response) if meta_response else None,
             "fbclid": fbclid,
             "lead_id": lead_id,
             "status": status,
@@ -91,111 +89,86 @@ class SupabaseLogger:
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
 
-        if not self._enabled:
+        if not self._is_enabled:
             logger.info(f"📝 [LOCAL LOG] Conversion: {event_name} | Tag: {tag_name} | Status: {status}")
-            return log_entry
+            return record
 
         try:
-            result = self._client.table("meta_conversion_logs").insert(log_entry).execute()
-            if result.data:
-                logger.info(f"📝 Conversion logged to Supabase — ID: {result.data[0].get('id')}")
-                return result.data[0]
-            return log_entry
+            result = self._client.table("entony_conversions").insert(record).execute()
+            logger.info(f"📝 Conversion logged to Supabase: {event_name} | {status}")
+            return result.data[0] if result.data else record
         except Exception as e:
-            logger.warning(f"⚠️ Failed to log conversion to Supabase: {e}")
-            return log_entry
+            logger.error(f"📝 Failed to log to Supabase: {e}")
+            return record
 
     async def find_fbclid_by_phone(self, phone: str) -> Optional[str]:
-        """
-        Look up fbclid from the leads table by phone number.
+        """Look up fbclid from leads table by phone number."""
+        self._ensure_init()
 
-        This is the "pulo do gato" — if the lead clicked a Facebook ad,
-        the fbclid was captured and stored. Sending it back to Meta
-        makes attribution precision close to 100%.
-
-        Args:
-            phone: Normalized phone number (digits only, with DDI 55)
-
-        Returns:
-            fbclid string if found, None otherwise
-        """
-        if not self._enabled:
+        if not self._is_enabled:
             return None
 
         try:
-            # Try exact match on phone
-            result = self._client.table("leads").select(
-                "id, fbclid, phone, whatsapp_jid"
-            ).or_(
-                f"phone.eq.{phone},whatsapp_jid.eq.{phone}@s.whatsapp.net"
-            ).limit(1).execute()
-
-            if result.data and len(result.data) > 0:
-                lead = result.data[0]
-                fbclid = lead.get("fbclid")
-                if fbclid:
-                    logger.info(f"🎯 fbclid FOUND for phone {phone[:6]}*** — Lead: {lead.get('id')}")
-                    return fbclid
-                else:
-                    logger.info(f"ℹ️ Lead found but no fbclid — Phone: {phone[:6]}***")
-            else:
-                logger.info(f"ℹ️ No lead found for phone {phone[:6]}***")
-
-            return None
-
+            result = (
+                self._client.table("leads")
+                .select("fbclid")
+                .eq("phone", phone)
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+            if result.data and result.data[0].get("fbclid"):
+                fbclid = result.data[0]["fbclid"]
+                logger.info(f"🔗 Found fbclid for phone: {fbclid[:20]}...")
+                return fbclid
         except Exception as e:
-            logger.warning(f"⚠️ Error looking up fbclid: {e}")
-            return None
+            logger.debug(f"🔗 fbclid lookup failed: {e}")
+
+        return None
 
     async def find_lead_id_by_phone(self, phone: str) -> Optional[str]:
-        """
-        Look up lead UUID by phone number for linking the conversion log.
+        """Look up lead ID from leads table by phone number."""
+        self._ensure_init()
 
-        Args:
-            phone: Normalized phone number
-
-        Returns:
-            Lead UUID if found, None otherwise
-        """
-        if not self._enabled:
+        if not self._is_enabled:
             return None
 
         try:
-            result = self._client.table("leads").select("id").or_(
-                f"phone.eq.{phone},whatsapp_jid.eq.{phone}@s.whatsapp.net"
-            ).limit(1).execute()
-
-            if result.data and len(result.data) > 0:
-                return result.data[0].get("id")
-            return None
-
+            result = (
+                self._client.table("leads")
+                .select("id")
+                .eq("phone", phone)
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+            if result.data and result.data[0].get("id"):
+                return str(result.data[0]["id"])
         except Exception as e:
-            logger.warning(f"⚠️ Error looking up lead: {e}")
-            return None
+            logger.debug(f"🔗 lead_id lookup failed: {e}")
 
-    async def get_recent_logs(self, limit: int = 50) -> list:
-        """
-        Fetch recent conversion logs for audit/dashboard.
+        return None
 
-        Returns:
-            List of recent conversion log entries
-        """
-        if not self._enabled:
+    async def get_recent_logs(self, limit: int = 50) -> List[Dict]:
+        """Fetch recent conversion logs for the audit endpoint."""
+        self._ensure_init()
+
+        if not self._is_enabled:
             return []
 
         try:
-            result = self._client.table("meta_conversion_logs").select(
-                "*"
-            ).order(
-                "created_at", desc=True
-            ).limit(limit).execute()
-
-            return result.data if result.data else []
-
+            result = (
+                self._client.table("entony_conversions")
+                .select("*")
+                .order("created_at", desc=True)
+                .limit(limit)
+                .execute()
+            )
+            return result.data or []
         except Exception as e:
-            logger.warning(f"⚠️ Error fetching conversion logs: {e}")
+            logger.error(f"📝 Failed to fetch logs: {e}")
             return []
 
 
-# Singleton
+# Singleton instance
 supabase_logger = SupabaseLogger()

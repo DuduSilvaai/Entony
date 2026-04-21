@@ -5,9 +5,18 @@ Loads environment variables with typed validation via pydantic-settings.
 
 import json
 import os
-from typing import Dict
+from typing import Dict, Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from functools import lru_cache
+
+
+# Default tag → event mapping
+DEFAULT_TAG_MAP = {
+    "vendido": "Purchase",
+    "nome sujo": "Lead_Disqualified_Credit",
+    "lead": "LeadSubmitted",
+    "carta de credito aprovada": "QualifiedLead",
+}
 
 
 class Settings(BaseSettings):
@@ -21,13 +30,13 @@ class Settings(BaseSettings):
     # Evolution API (webhook security)
     evolution_api_key: str = ""
 
-    # Conversion settings — multi-label map (preferred)
-    # JSON string: '{"vendido":"Purchase","lead":"LeadSubmitted"}'
-    conversion_tag_map_json: str = ""
-
-    # Legacy single-mapping (used as fallback if conversion_tag_map_json is empty)
-    conversion_tag_name: str = "Pago"
+    # Conversion settings
+    # Legacy single-tag field (kept for backward compat)
+    conversion_tag_name: str = "vendido"
     conversion_event_name: str = "Purchase"
+
+    # Multi-tag map: JSON string of { "tag_name": "MetaEventName" }
+    conversion_tag_map_json: str = json.dumps(DEFAULT_TAG_MAP)
 
     conversion_default_value: float = 0.0
     conversion_currency: str = "BRL"
@@ -41,28 +50,21 @@ class Settings(BaseSettings):
     port: int = 9000
 
     model_config = SettingsConfigDict(
-        env_file=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"),
+        env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
-        case_sensitive=False,
     )
 
-    @property
-    def conversion_tag_map(self) -> Dict[str, str]:
-        """Returns label→event map.
-
-        Uses CONVERSION_TAG_MAP_JSON if set; falls back to the legacy
-        CONVERSION_TAG_NAME / CONVERSION_EVENT_NAME single-mapping.
-        """
-        if self.conversion_tag_map_json:
-            try:
-                return json.loads(self.conversion_tag_map_json)
-            except json.JSONDecodeError:
-                pass
-        return {self.conversion_tag_name: self.conversion_event_name}
+    def get_tag_map(self) -> Dict[str, str]:
+        """Parse the JSON tag map into a Python dict (lowercase keys)."""
+        try:
+            raw = json.loads(self.conversion_tag_map_json)
+            return {k.strip().lower(): v for k, v in raw.items()}
+        except (json.JSONDecodeError, AttributeError):
+            # Fallback to legacy single-tag
+            return {self.conversion_tag_name.strip().lower(): self.conversion_event_name}
 
 
 @lru_cache()
 def get_settings() -> Settings:
-    """Get cached settings singleton."""
     return Settings()
