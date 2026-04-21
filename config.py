@@ -41,10 +41,6 @@ class Settings(BaseSettings):
     conversion_default_value: float = 0.0
     conversion_currency: str = "BRL"
 
-    # Supabase (audit logging + fbclid lookup)
-    supabase_url: str = ""
-    supabase_service_key: str = ""
-
     # Server
     host: str = "0.0.0.0"
     port: int = 9000
