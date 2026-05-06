@@ -6,10 +6,7 @@ Microserviço que escuta eventos de etiquetas do WhatsApp via Evolution API e di
 
 ## Fluxo
 
-```
 WhatsApp (etiqueta "Pago") → Evolution API → Entony → Meta CAPI
-                                                  ↓
-                                              Supabase (audit log)
 ```
 
 ## Setup Rápido
@@ -30,31 +27,7 @@ cp .env.example .env
 # Editar .env com suas credenciais
 ```
 
-### 3. Criar tabela no Supabase
-
-Execute o SQL abaixo no SQL Editor do Supabase:
-
-```sql
-CREATE TABLE IF NOT EXISTS meta_conversion_logs (
-    id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
-    phone_hash TEXT NOT NULL,
-    event_name TEXT NOT NULL DEFAULT 'Purchase',
-    event_value NUMERIC(12,2) DEFAULT 0,
-    currency TEXT DEFAULT 'BRL',
-    fbclid TEXT,
-    lead_id UUID,
-    meta_response JSONB,
-    tag_name TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'sent',
-    error_message TEXT,
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE INDEX idx_mcl_created ON meta_conversion_logs(created_at DESC);
-CREATE INDEX idx_mcl_status ON meta_conversion_logs(status);
-```
-
-### 4. Rodar
+### 3. Rodar
 
 ```bash
 python main.py
@@ -76,7 +49,6 @@ uvicorn main:app --port 9000 --reload
 |:---|:---|:---|
 | `POST` | `/webhook/whatsapp` | Webhook principal (Evolution API) |
 | `POST` | `/api/conversions/send` | Envio manual de conversão (teste) |
-| `GET` | `/api/conversions/logs` | Logs de auditoria |
 | `GET` | `/health` | Health check |
 
 ## Deploy (Docker)

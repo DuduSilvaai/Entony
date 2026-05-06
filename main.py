@@ -9,7 +9,7 @@ Conversions API for precise ad attribution.
 Supports multiple tags via CONVERSION_TAG_MAP_JSON:
   {"vendido": "Purchase", "lead": "LeadSubmitted", ...}
 
-Author: Vibe Energia
+Author: Dudu (Vexel)
 """
 
 import logging
@@ -32,6 +32,7 @@ from services.meta_capi import meta_capi_client, normalize_phone, hash_sha256
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]  # Force stdout to avoid "error" severity in log collectors
 )
 logger = logging.getLogger("entony")
 
@@ -162,7 +163,7 @@ async def webhook_whatsapp(request: Request):
     )
 
     if "label" not in event_type and "tag" not in event_type and not has_label_data:
-        logger.info(f"⏭️ Ignoring non-label event: \"{event_type}\"")
+        logger.debug(f"⏭️ Ignoring non-label event: \"{event_type}\"")
         return ConversionResponse(
             success=True,
             message=f"Event ignored — not a label event",
@@ -202,7 +203,7 @@ async def webhook_whatsapp(request: Request):
         fbclid=None, # Stateless: no DB lookup for fbclid
     )
 
-    # ── 9. Return response ────────────────────────────────────────────
+    # ── 9. Return response ───────────────────────────────────────────
     if meta_result.get("success"):
         logger.info(f"✅ SENT SUCCESSFULLY — {meta_event_name} for {normalized_phone[:6]}***")
     else:
@@ -252,18 +253,33 @@ async def manual_send_conversion(req: ManualConversionRequest):
 # HELPER FUNCTIONS — Payload extraction
 # ==========================================================================
 def _extract_label_name(payload: Dict[str, Any]) -> Optional[str]:
+    """Extract label/tag name from various possible Evolution API payload structures."""
+    # Top level keys
     for key in ["labelName", "tagName", "label_name", "tag_name"]:
-        if key in payload: return payload[key]
+        if key in payload and payload[key]: return payload[key]
     
     data = payload.get("data", {})
     if isinstance(data, dict):
+        # Data level keys
         for key in ["labelName", "tagName", "label_name", "tag_name", "label", "tag"]:
             val = data.get(key)
-            if isinstance(val, str): return val
+            if isinstance(val, str) and val: return val
         
+        # Nested label/tag object
         label_obj = data.get("label") or data.get("tag")
-        if isinstance(label_obj, dict): return label_obj.get("name") or label_obj.get("labelName")
+        if isinstance(label_obj, dict): 
+            val = label_obj.get("name") or label_obj.get("labelName") or label_obj.get("tagName")
+            if val: return val
 
+        # Evolution API messages.upsert often has labels inside message object
+        message = data.get("message")
+        if isinstance(message, dict):
+            labels = message.get("labels")
+            if isinstance(labels, list) and len(labels) > 0:
+                first = labels[0]
+                return first if isinstance(first, str) else first.get("name")
+
+        # Labels/Tags list
         labels = data.get("labels") or data.get("tags")
         if isinstance(labels, list) and len(labels) > 0:
             first = labels[0]
